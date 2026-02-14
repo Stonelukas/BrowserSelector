@@ -1,0 +1,4 @@
+#!/bin/sh
+SCRIPT="$0"
+[ -L "$SCRIPT" ] && SCRIPT="$(readlink -f "$SCRIPT")"
+exec python3 "$(dirname "$SCRIPT")/main.py" "$@"

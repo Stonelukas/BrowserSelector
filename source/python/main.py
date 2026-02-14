@@ -1,218 +1,207 @@
+#!/usr/bin/env python3
+"""BrowserSelector - Choose which browser opens your links."""
+
 import gi
 import subprocess
-import getpass
-import threading
 import sys
-from xdg.DesktopEntry import DesktopEntry
-import json
 import os
+import shlex
 from urllib.parse import urlparse
-import glob
 
-# Import GTK4
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, Gdk
 
-user = getpass.getuser()
-argument = sys.argv[1] if len(sys.argv) > 1 else ""
+import config
+from browser_scan import get_browsers
+from settings import SettingsWindow
 
-def parse_desktop_entry(file_path):
-    entry = DesktopEntry()
-    entry.parse(file_path)
-    
-    icon = entry.getIcon()
-    
-    if icon and '/' in icon and 'appimage' in file_path.lower():
-        if not os.path.exists(icon):
-            app_dir = os.path.dirname(file_path)
-            possible_icon_paths = [
-                os.path.join(app_dir, icon),
-                os.path.join(app_dir, '..', icon),
-                os.path.join(app_dir, '..', '..', icon),
-                os.path.join(app_dir, 'icons', icon),
-                os.path.join(app_dir, '..', 'icons', icon)
-            ]
-            
-            for icon_path in possible_icon_paths:
-                if os.path.exists(icon_path):
-                    icon = icon_path
-                    break
-            else:
-                icon = "web-browser"
-    
-    return {
-        "name": entry.getName(),
-        "exec_command": entry.getExec(),
-        "icon": icon or "web-browser"
-    }
+APP_ID = 'com.github.browserselector'
 
-def scan_browser_desktop_files():
-    browser_files = {}
-    locations = [
-        f'/home/{user}/.local/share/applications/*.desktop',
-        f'/home/{user}/.local/share/flatpak/exports/share/applications/*.desktop',
-        '/usr/share/applications/*.desktop',
-        '/usr/local/share/applications/*.desktop',
-        '/var/lib/flatpak/app/*/*/*/*/export/share/applications/*.desktop',
-        '/var/lib/flatpak/exports/share/applications/*.desktop'
-    ]
-    
-    for location in locations:
-        base_dir = os.path.dirname(location.split('*')[0])
-        if not os.path.exists(base_dir):
-            continue
-            
-        if not os.access(base_dir, os.R_OK):
-            continue
-            
-        try:
-            found_files = glob.glob(location)
-            
-            for file_path in found_files:
-                try:
-                    if not os.path.exists(file_path):
-                        continue
-                        
-                    if not os.access(file_path, os.R_OK):
-                        continue
-                        
-                    entry = DesktopEntry()
-                    entry.parse(file_path)
-                    name = entry.getName()
-                    categories = entry.getCategories()
-                    
-                    if not categories:
-                        continue
-                        
-                    cat_list = [cat.strip().lower() for cat in categories]
-                    
-                    browser_categories = ['web-browser', 'browser', 'internet', 'web browser', 'webbrowser']
-                    if any(cat in browser_categories for cat in cat_list):
-                        browser_files[name] = file_path
-                except:
-                    continue
-        except:
-            continue
-    
-    return list(browser_files.values())
 
-def browsers():
-    browser_files = scan_browser_desktop_files()
-    installed_browsers = []
-    for file_path in browser_files:
-        try:
-            installed_browsers.append(parse_desktop_entry(file_path))
-        except:
-            continue
-    return installed_browsers
-
-def launch_browser(exec_command, browser_name):
-    subprocess.run(exec_command, shell=True, capture_output=True, text=True)
-
-def remember(link, browser_name):
-    entries = json.load(open("output.json")) if os.path.exists("output.json") else []
-    for entry in entries:
-        if entry["url"] == link:
-            entry["browser"] = browser_name
-            break
-    else:
-        entries.append({"url": link, "browser": browser_name})
-    json.dump(entries, open("output.json", "w"), indent=4)
-
-def get_browser_for_link(link):
+def launch_browser(exec_command, url):
+    """Launch a browser with the given URL, fully detached."""
     try:
-        if os.path.exists("output.json") and os.path.getsize("output.json") > 0:
-            with open("output.json", "r") as file:
-                entries = json.load(file)
-                
-                parsed_url = urlparse(link)
-                domain = parsed_url.netloc
-                
-                for entry in entries:
-                    saved_url = urlparse(entry["url"])
-                    saved_domain = saved_url.netloc
-                    
-                    if domain == saved_domain:
-                        return entry["browser"]
-        return None
-    except json.JSONDecodeError:
-        return None
+        args = shlex.split(exec_command)
+        if url:
+            args.append(url)
+        subprocess.Popen(
+            args,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"Failed to launch browser: {e}", file=sys.stderr)
 
-def on_activate(app):
-    # Create main window
-    win = Gtk.ApplicationWindow(application=app, title="BrowserSelector")
-    win.set_icon_name("web-browser")
+
+def on_activate(app, url):
+    """Main activation handler."""
+    browser_list = get_browsers()
+    cfg = config.load_config()
+    remembered = config.load_remembered()
+    appearance = cfg["appearance"]
+
+    # Auto-launch remembered browser for this domain
+    if url:
+        domain = urlparse(url).netloc
+        saved_name = remembered.get(domain) if domain else None
+        if saved_name:
+            for browser in browser_list:
+                if browser["name"] == saved_name:
+                    launch_browser(browser["exec_command"], url)
+                    app.quit()
+                    return
+
+    # Find default browser for highlighting (no auto-launch)
+    default_browser = None
+    if cfg["default_browser"]:
+        for browser in browser_list:
+            if browser["name"] == cfg["default_browser"]:
+                default_browser = browser
+                break
+
+    # Build selector window
+    win = Gtk.ApplicationWindow(application=app, title="Browser Selector")
+    win.set_icon_name("applications-internet")
     win.set_decorated(False)
-    
-    # Apply rounded corners
-    css_provider = Gtk.CssProvider()
-    css = """
-    window {
-        background-color: @theme_bg_color;
-        border-radius: 12px;
-    }
-    """
-    css_provider.load_from_data(css, -1)
-    display = Gdk.Display.get_default()
-    Gtk.StyleContext.add_provider_for_display(display, css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    win.set_resizable(False)
+    win.set_default_size(-1, -1)
 
-    # Create main layout
+    css_provider = Gtk.CssProvider()
+    css = f"""
+    window {{
+        background-color: @theme_bg_color;
+        border-radius: {appearance["border_radius"]}px;
+    }}
+    .browser-btn {{
+        min-width: 80px;
+        min-height: 36px;
+    }}
+    .url-label {{
+        font-size: 11px;
+        opacity: 0.7;
+    }}
+    """
+    css_provider.load_from_string(css)
+    display = Gdk.Display.get_default()
+    Gtk.StyleContext.add_provider_for_display(
+        display, css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
+
     main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
     main_box.set_margin_top(20)
     main_box.set_margin_bottom(20)
     main_box.set_margin_start(20)
     main_box.set_margin_end(20)
 
-    hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
-    hbox.set_halign(Gtk.Align.CENTER)
+    # Gear button (top-right)
+    header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+    header_box.set_halign(Gtk.Align.END)
+    gear_btn = Gtk.Button()
+    gear_btn.set_icon_name("emblem-system")
+    gear_btn.set_tooltip_text("Settings")
+    gear_btn.add_css_class("flat")
+    gear_btn.connect('clicked', lambda _: SettingsWindow(
+        browsers=browser_list, on_save=lambda c: None
+    ).present())
+    header_box.append(gear_btn)
+    main_box.append(header_box)
 
-    link_entry = Gtk.Entry()
-    link_entry.set_text(argument)
+    # Show the URL being opened
+    if url:
+        url_label = Gtk.Label(label=url)
+        url_label.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
+        url_label.add_css_class("url-label")
+        url_label.set_selectable(True)
+        main_box.append(url_label)
 
-    remember_checkbox = Gtk.CheckButton(label="Remember this")
+    # Browser buttons grid
+    columns = appearance["grid_columns"]
+    grid = Gtk.Grid()
+    grid.set_column_spacing(15)
+    grid.set_row_spacing(15)
+    grid.set_halign(Gtk.Align.CENTER)
 
-    def on_button_clicked(exec_command, browser_name):
-        link = link_entry.get_text()
-        full_command = f"{exec_command} '{link}'"
-        threading.Thread(target=launch_browser, args=(full_command, browser_name)).start()
-        if remember_checkbox.get_active():
-            remember(link, browser_name)
-        win.destroy()
+    remember_checkbox = Gtk.CheckButton(label="Remember for this site")
+    remember_checkbox.set_active(True)
 
-    link = link_entry.get_text()
-    saved_browser = get_browser_for_link(link)
+    def on_button_clicked(browser):
+        if remember_checkbox.get_active() and url:
+            domain = urlparse(url).netloc
+            if domain:
+                data = config.load_remembered()
+                data[domain] = browser["name"]
+                config.save_remembered(data)
+        launch_browser(browser["exec_command"], url)
+        win.close()
 
-    if saved_browser:
-        for browser in browsers():
-            if browser["name"] == saved_browser:
-                on_button_clicked(browser["exec_command"], saved_browser)
-                return
-
-    # Create browser buttons
-    for browser in browsers():
+    for i, browser in enumerate(browser_list):
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        
+        vbox.set_halign(Gtk.Align.CENTER)
+
         icon_path = browser["icon"]
-        if os.path.exists(icon_path):
+        if os.path.isfile(icon_path):
             icon = Gtk.Image.new_from_file(icon_path)
         else:
             icon = Gtk.Image.new_from_icon_name(icon_path)
-            
-        icon.set_pixel_size(48)
+        icon.set_pixel_size(appearance["icon_size"])
         vbox.append(icon)
-        btn = Gtk.Button(label=browser["name"])
-        btn.connect('clicked', lambda button, b=browser: on_button_clicked(b["exec_command"], b["name"]))
-        vbox.append(btn)
-        hbox.append(vbox)
 
-    main_box.append(hbox)
-    main_box.append(link_entry)
-    main_box.append(remember_checkbox)
+        btn = Gtk.Button(label=browser["name"])
+        btn.add_css_class("browser-btn")
+        if default_browser and browser["name"] == default_browser["name"]:
+            btn.add_css_class("suggested-action")
+        btn.connect('clicked', lambda _, b=browser: on_button_clicked(b))
+        vbox.append(btn)
+        grid.attach(vbox, i % columns, i // columns, 1, 1)
+
+    if not browser_list:
+        no_browsers = Gtk.Label(label="No browsers found on this system.")
+        grid.attach(no_browsers, 0, 0, columns, 1)
+
+    main_box.append(grid)
+
+    if url:
+        main_box.append(remember_checkbox)
 
     win.set_child(main_box)
+
+    # Keyboard shortcuts: Enter = launch default, Escape = close
+    # CAPTURE phase so window intercepts before focused child widgets
+    key_ctrl = Gtk.EventControllerKey()
+    key_ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    def on_key_pressed(_ctrl, keyval, _keycode, _state):
+        if keyval == Gdk.KEY_Return and default_browser:
+            on_button_clicked(default_browser)
+            return True
+        if keyval == Gdk.KEY_Escape:
+            win.close()
+            return True
+        return False
+    key_ctrl.connect('key-pressed', on_key_pressed)
+    win.add_controller(key_ctrl)
+
     win.present()
 
-# Start application
-app = Gtk.Application(application_id='com.joso.browserselector')
-app.connect('activate', on_activate)
-app.run(None)
+
+def on_settings_activate(app):
+    """Open settings window directly (--settings mode)."""
+    SettingsWindow(browsers=get_browsers(), application=app).present()
+
+
+def main():
+    # Handle --settings flag: open settings without a URL
+    if '--settings' in sys.argv:
+        app = Gtk.Application(application_id=APP_ID + '.settings')
+        app.connect('activate', on_settings_activate)
+        app.run(None)
+        return
+
+    url = sys.argv[1] if len(sys.argv) > 1 else ""
+    app = Gtk.Application(application_id=APP_ID)
+    app.connect('activate', lambda a: on_activate(a, url))
+    app.run(None)
+
+
+if __name__ == '__main__':
+    main()
